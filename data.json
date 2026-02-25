@@ -3,48 +3,42 @@
     "gtR_JzJplErvXN45KHKMfX8cTDLw4VnmxTTCj5tc3vU": {
       "name": "toto",
       "goles": 0,
-      "asistencias": 0,
       "wins": 0,
       "matches": 0
     },
     "toto": {
       "name": "toto",
       "goles": 11,
-      "asistencias": 5,
       "wins": 1,
       "matches": 2
     },
     "lNJhCFH4cVxIYBoe6vIJb3kUn30KzZsBwA2Qq3C0Uac": {
       "name": "Soy malardo",
       "goles": 0,
-      "asistencias": 0,
       "wins": 0,
       "matches": 0
     },
     "Soy malardo": {
       "name": "Soy malardo",
-      "goles": 7,
-      "asistencias": 4,
-      "wins": 1,
-      "matches": 2
+      "goles": 0,
+      "wins": 0,
+      "matches": 0
     },
     "UUm02zVM-kvXw8Z1-SR2li1XhDCwU71AbT-Go5n-i-g": {
       "name": "Xyz",
       "goles": 0,
-      "asistencias": 0,
       "wins": 0,
       "matches": 0
     },
     "57eRFoXOKQhsQTsRObGWG0vejFxWhfXlAnFiuSWlM14": {
       "name": "LaChispa (apagada) :v",
       "goles": 0,
-      "asistencias": 0,
       "wins": 0,
       "matches": 0
     }
   },
   "admins": [
-    "toto"
+    "auth:gtR_JzJplErvXN45KHKMfX8cTDLw4VnmxTTCj5tc3vU"
   ],
   "secret": "!iam_c4yllv5syp"
 }
