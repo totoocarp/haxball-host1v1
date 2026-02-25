@@ -1,0 +1,41 @@
+{
+  "room": {
+    "name": "🐔 1v1 Gana Sigue | !help !stats !rank",
+    "maxPlayers": 15,
+    "public": true,
+    "geo": { "code": "AR", "lat": -34.6037, "lon": -58.3816 },
+    "token": ""
+  },
+  "game": {
+    "scoreLimit": 5,
+    "timeLimit": 0,
+    "maxTeamSize": 1,
+    "afkWarnSeconds": 20,
+    "afkKickSeconds": 35,
+    "watchdogIntervalMs": 2000,
+    "freezeSeconds": 14,
+    "inactivityRestartSeconds": 45,
+    "doubleTouchWindowMs": 1200,
+    "commandCooldownMs": 900,
+    "autoSaveIntervalMs": 120000,
+    "lagPingThreshold": 220,
+    "lagKickThreshold": 500,
+    "lagWarnCount": 3,
+    "lagKickCount": 6
+  },
+  "features": {
+    "enableElo": true,
+    "baseElo": 1000,
+    "eloK": 26,
+    "maintenanceMode": false,
+    "spectatorPriority": "queue"
+  },
+  "links": {
+    "discord": "https://discord.gg/tu-servidor"
+  },
+  "security": {
+    "maxNameChangesPerMinute": 5,
+    "reconnectGraceSeconds": 45,
+    "maxChatLength": 160
+  }
+}
