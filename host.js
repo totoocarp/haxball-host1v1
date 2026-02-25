@@ -20,6 +20,7 @@ const runtime = {
   nameChangeLog: new Map(),
   touchWindow: { active: false, team: null, at: 0, playerId: null },
   ball: { lastPos: null, lastMoveAt: Date.now() },
+  lastGameActivityAt: Date.now(),
   maintenanceReason: '',
   lastKickerId: null,
   secondKickerId: null,
@@ -79,12 +80,24 @@ function eloDelta(a, b, resultA) {
 function cosmeticPrefix(player, key) {
   if (isAdmin(player)) return '👑ADMIN';
   const winsRanking = Object.entries(store.data.players)
+    .filter(([, p]) => (p.wins || 0) > 0)
     .sort(([, a], [, b]) => (b.wins || 0) - (a.wins || 0))
     .map(([k]) => k);
   const idx = winsRanking.indexOf(key);
   if (idx === 0) return '🥇TOP1';
   if (idx > -1 && idx < 10) return '🏅TOP10';
   return '🎮';
+}
+
+function resolvePlayerKey(player) {
+  const candidates = [player?.auth, player?.conn, player?.name].filter(Boolean);
+  return candidates.find((key) => !!store.data.players[key]) || candidates[0] || null;
+}
+
+function getPlayerStats(player) {
+  const key = resolvePlayerKey(player);
+  if (!key) return null;
+  return store.ensurePlayer(key, player.name);
 }
 
 function sendProfile(room, player, targetStats) {
@@ -193,6 +206,16 @@ HaxballJS.then((HBInit) => {
         'bold'
       );
     },
+    stats: ({ player }) => {
+      const stats = getPlayerStats(player);
+      if (!stats) return;
+      sendProfile(room, player, stats);
+    },
+    perfil: ({ player, args }) => {
+      const target = parseTarget(room, args[0]) || player;
+      const targetStats = getPlayerStats(target);
+      if (!targetStats) return;
+      sendProfile(room, player, targetStats);
     stats: ({ player }) => sendProfile(room, player, store.data.players[playerKey(player)]),
     perfil: ({ player, args }) => {
       const target = parseTarget(room, args[0]) || player;
@@ -226,7 +249,8 @@ HaxballJS.then((HBInit) => {
     },
     elo: ({ player }) => room.sendAnnouncement(`⭐ ELO actual: ${store.data.players[playerKey(player)].elo}`, player.id, 0x7bdff2, 'bold'),
     racha: ({ player }) => {
-      const p = store.data.players[playerKey(player)];
+      const p = getPlayerStats(player);
+      if (!p) return;
       room.sendAnnouncement(`🔥 Racha actual: ${p.currentStreak} | Mejor racha: ${p.bestStreak}`, player.id, 0xff6b6b, 'bold');
     },
     afk: ({ player }) => {
@@ -243,7 +267,8 @@ HaxballJS.then((HBInit) => {
       room.sendAnnouncement(`📡 Ping: ${ping}ms`, player.id, ping > config.game.lagPingThreshold ? 0xff9f1c : 0x2ec4b6, 'bold');
     },
     historial: ({ player }) => {
-      const p = store.data.players[playerKey(player)];
+      const p = getPlayerStats(player);
+      if (!p) return;
       const season = getSeasonStats(p);
       room.sendAnnouncement(`📚 Temp ${store.data.season.id}: ${season.wins}W/${season.losses}L (${season.matches} PJ)`, player.id, 0xbde0fe, 'bold');
     },
@@ -269,7 +294,8 @@ HaxballJS.then((HBInit) => {
       if (!isAdmin(player)) return;
       const target = parseTarget(room, args[0]);
       if (!target) return;
-      const p = store.data.players[playerKey(target)];
+      const p = getPlayerStats(target);
+      if (!p) return;
       Object.assign(p, { goles: 0, wins: 0, matches: 0, losses: 0, draws: 0, currentStreak: 0, bestStreak: 0, elo: config.features.baseElo });
       store.save();
     },
@@ -296,7 +322,9 @@ HaxballJS.then((HBInit) => {
       const target = parseTarget(room, args[0]);
       const value = Number(args[1]);
       if (!target || Number.isNaN(value)) return;
-      store.data.players[playerKey(target)].elo = value;
+      const targetStats = getPlayerStats(target);
+      if (!targetStats) return;
+      targetStats.elo = value;
       store.save();
     },
     reloadconfig: ({ player }) => {
@@ -397,6 +425,9 @@ HaxballJS.then((HBInit) => {
     if (!info) return;
     info.lastMoveAt = now();
     info.warned = false;
+    if (player.team !== TEAM_SPEC && room.getScores()) {
+      runtime.lastGameActivityAt = now();
+    }
   };
 
   room.onPlayerBallKick = (player) => {
@@ -408,6 +439,7 @@ HaxballJS.then((HBInit) => {
     }
     runtime.secondKickerId = runtime.lastKickerId;
     runtime.lastKickerId = player.id;
+    runtime.lastGameActivityAt = now();
     if (scores && scores.time <= 2) {
       runtime.touchWindow = { active: true, team: player.team, at: now(), playerId: player.id };
     }
@@ -416,6 +448,8 @@ HaxballJS.then((HBInit) => {
   room.onTeamGoal = () => {
     const scorer = room.getPlayer(runtime.lastKickerId);
     if (!scorer) return;
+    const scorerStats = getPlayerStats(scorer);
+    if (!scorerStats) return;
     const scorerStats = store.data.players[playerKey(scorer)];
     scorerStats.goles += 1;
 
@@ -429,6 +463,8 @@ HaxballJS.then((HBInit) => {
     const blue = room.getPlayerList().find((p) => p.team === TEAM_BLUE);
 
     [red, blue].filter(Boolean).forEach((p) => {
+      const stats = getPlayerStats(p);
+      if (!stats) return;
       const stats = store.data.players[playerKey(p)];
       stats.matches += 1;
       const season = getSeasonStats(stats);
@@ -450,6 +486,9 @@ HaxballJS.then((HBInit) => {
     });
 
     if (config.features.enableElo && red && blue) {
+      const redStats = getPlayerStats(red);
+      const blueStats = getPlayerStats(blue);
+      if (!redStats || !blueStats) return;
       const redStats = store.data.players[playerKey(red)];
       const blueStats = store.data.players[playerKey(blue)];
       const redRes = winner === TEAM_RED ? 1 : 0;
@@ -466,6 +505,7 @@ HaxballJS.then((HBInit) => {
     runtime.touchWindow.active = false;
     runtime.ball.lastPos = null;
     runtime.ball.lastMoveAt = now();
+    runtime.lastGameActivityAt = now();
     room.getPlayerList().forEach((p) => {
       const afk = runtime.afk.get(p.id);
       if (afk) {
@@ -593,11 +633,21 @@ HaxballJS.then((HBInit) => {
       runtime.ball.lastMoveAt = now();
     }
 
-    if (scores.time >= config.game.inactivityRestartSeconds && stillFor >= 10) {
+    const inactiveFor = Math.floor((now() - runtime.lastGameActivityAt) / 1000);
+    const playersIdle = players
+      .filter((p) => p.team !== TEAM_SPEC)
+      .every((p) => {
+        const afk = runtime.afk.get(p.id);
+        if (!afk) return true;
+        return Math.floor((now() - afk.lastMoveAt) / 1000) >= Math.min(config.game.afkWarnSeconds, 15);
+      });
+
+    if (inactiveFor >= config.game.inactivityRestartSeconds && stillFor >= config.game.freezeSeconds && playersIdle) {
       room.sendAnnouncement('🛡 Watchdog: inactividad detectada, reinicio de round.', null, 0xff595e, 'bold');
       room.stopGame();
       setTimeout(() => robustBalance(room), 500);
       runtime.ball.lastMoveAt = now();
+      runtime.lastGameActivityAt = now();
     }
   }, config.game.watchdogIntervalMs);
 
