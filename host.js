@@ -171,7 +171,7 @@ HaxballJS.then((HBInit) => {
   const commandHandlers = {
     help: ({ player }) => {
       room.sendAnnouncement(
-        '📘 Públicos: !stats !rank !elo !top !racha !afk !ping !historial !perfil !wins !goles !asistencias !discord\n🔒 Admin: !forcestart !forceend !setwins !resetstats !mute !unmute !clearchat !setelo !reloadconfig !restart !ban !unban !modo !season',
+        '📘 Públicos: !stats !rank !elo !top !racha !afk !ping !historial !perfil !wins !goles !discord\n🔒 Admin: !forcestart !forceend !setwins !resetstats !mute !unmute !clearchat !setelo !reloadconfig !restart !ban !unban !modo !season',
         player.id,
         0xffffff,
         'bold'
@@ -200,15 +200,6 @@ HaxballJS.then((HBInit) => {
         .map((p, i) => `${i + 1}. ${p.name}: ${p.goles}`)
         .join('\n');
       room.sendAnnouncement(`⚽ Top Goles\n${rows || 'Sin datos'}`, player.id, 0xff763d, 'bold');
-    },
-    asistencias: ({ player }) => {
-      const rows = Object.values(store.data.players)
-        .filter((p) => (p.asistencias || 0) > 0)
-        .sort((a, b) => b.asistencias - a.asistencias)
-        .slice(0, 10)
-        .map((p, i) => `${i + 1}. ${p.name}: ${p.asistencias}`)
-        .join('\n');
-      room.sendAnnouncement(`🎯 Top Asistencias\n${rows || 'Sin datos'}`, player.id, 0x9cff9c, 'bold');
     },
     rank: ({ player }) => {
       const key = playerKey(player);
@@ -263,7 +254,7 @@ HaxballJS.then((HBInit) => {
       const target = parseTarget(room, args[0]);
       if (!target) return;
       const p = store.data.players[playerKey(target)];
-      Object.assign(p, { goles: 0, asistencias: 0, wins: 0, matches: 0, losses: 0, draws: 0, currentStreak: 0, bestStreak: 0, elo: config.features.baseElo });
+      Object.assign(p, { goles: 0, wins: 0, matches: 0, losses: 0, draws: 0, currentStreak: 0, bestStreak: 0, elo: config.features.baseElo });
       store.save();
     },
     mute: ({ player, args }) => {
@@ -415,11 +406,6 @@ HaxballJS.then((HBInit) => {
     if (!scorer) return;
     const scorerStats = store.data.players[playerKey(scorer)];
     scorerStats.goles += 1;
-
-    const assister = room.getPlayer(runtime.secondKickerId);
-    if (assister && assister.team === scorer.team && assister.id !== scorer.id) {
-      store.data.players[playerKey(assister)].asistencias += 1;
-    }
 
     runtime.touchWindow.active = false;
     store.save();

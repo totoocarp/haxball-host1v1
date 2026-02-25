@@ -8,7 +8,6 @@ function defaultPlayerStats(name, baseElo) {
   return {
     name,
     goles: 0,
-    asistencias: 0,
     wins: 0,
     matches: 0,
     losses: 0,
@@ -63,9 +62,10 @@ class DataStore {
 
   migrate() {
     Object.entries(this.data.players).forEach(([key, player]) => {
+      const { asistencias: _legacyAsistencias, ...rest } = player;
       this.data.players[key] = {
         ...defaultPlayerStats(player.name || key, this.baseElo),
-        ...player,
+        ...rest,
         seasons: player.seasons || {},
         achievements: Array.isArray(player.achievements) ? player.achievements : []
       };

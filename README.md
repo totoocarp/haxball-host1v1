@@ -33,7 +33,6 @@ HAXBALL_TOKEN=tu_token node host.js
 - `!top`
 - `!wins`
 - `!goles`
-- `!asistencias`
 - `!racha`
 - `!afk`
 - `!ping`
