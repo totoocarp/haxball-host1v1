@@ -216,6 +216,10 @@ HaxballJS.then((HBInit) => {
       const targetStats = getPlayerStats(target);
       if (!targetStats) return;
       sendProfile(room, player, targetStats);
+    stats: ({ player }) => sendProfile(room, player, store.data.players[playerKey(player)]),
+    perfil: ({ player, args }) => {
+      const target = parseTarget(room, args[0]) || player;
+      sendProfile(room, player, store.data.players[playerKey(target)]);
     },
     wins: ({ player }) => commandHandlers.top({ player }),
     top: ({ player }) => {
@@ -446,6 +450,7 @@ HaxballJS.then((HBInit) => {
     if (!scorer) return;
     const scorerStats = getPlayerStats(scorer);
     if (!scorerStats) return;
+    const scorerStats = store.data.players[playerKey(scorer)];
     scorerStats.goles += 1;
 
     runtime.touchWindow.active = false;
@@ -460,6 +465,7 @@ HaxballJS.then((HBInit) => {
     [red, blue].filter(Boolean).forEach((p) => {
       const stats = getPlayerStats(p);
       if (!stats) return;
+      const stats = store.data.players[playerKey(p)];
       stats.matches += 1;
       const season = getSeasonStats(stats);
       season.matches += 1;
@@ -483,6 +489,8 @@ HaxballJS.then((HBInit) => {
       const redStats = getPlayerStats(red);
       const blueStats = getPlayerStats(blue);
       if (!redStats || !blueStats) return;
+      const redStats = store.data.players[playerKey(red)];
+      const blueStats = store.data.players[playerKey(blue)];
       const redRes = winner === TEAM_RED ? 1 : 0;
       const delta = eloDelta(redStats.elo, blueStats.elo, redRes);
       redStats.elo += delta;
