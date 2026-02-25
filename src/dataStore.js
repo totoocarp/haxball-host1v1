@@ -45,7 +45,7 @@ class DataStore {
       };
       this.ensureSecret();
       this.migrate();
-      this.ensureOwnerAdmin();
+      this.normalizeAdmins();
       this.save();
     } catch (error) {
       console.error('[DATA] Error leyendo data.json, regenerando:', error.message);
@@ -54,9 +54,18 @@ class DataStore {
     }
   }
 
-  ensureOwnerAdmin() {
-    const admins = new Set(this.data.admins || []);
-    admins.add(OWNER_NAME);
+  normalizeAdmins() {
+    const admins = new Set((this.data.admins || []).filter((entry) => typeof entry === 'string' && entry.trim().length > 0));
+
+    if (admins.has(OWNER_NAME)) {
+      Object.entries(this.data.players).forEach(([key, player]) => {
+        if (player?.name?.toLowerCase?.() === OWNER_NAME && key !== OWNER_NAME) {
+          admins.add(`auth:${key}`);
+        }
+      });
+      admins.delete(OWNER_NAME);
+    }
+
     this.data.admins = Array.from(admins);
   }
 

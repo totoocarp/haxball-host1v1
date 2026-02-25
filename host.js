@@ -30,11 +30,27 @@ const runtime = {
 const TEAM_SPEC = 0;
 const TEAM_RED = 1;
 const TEAM_BLUE = 2;
-const OWNER_NAME = 'toto';
+
+function getAdminTokens(player) {
+  const tokens = [];
+  if (typeof player?.id === 'number') tokens.push(`id:${player.id}`);
+  if (player?.auth) tokens.push(`auth:${player.auth}`);
+  if (player?.conn) tokens.push(`conn:${player.conn}`);
+  if (player?.ip) tokens.push(`ip:${player.ip}`);
+  return tokens;
+}
+
+function getPreferredAdminToken(player) {
+  if (player?.auth) return `auth:${player.auth}`;
+  if (player?.conn) return `conn:${player.conn}`;
+  if (player?.ip) return `ip:${player.ip}`;
+  if (typeof player?.id === 'number') return `id:${player.id}`;
+  return null;
+}
 
 const now = () => Date.now();
 const playerKey = (player) => player?.auth || player?.conn || player?.name;
-const isAdmin = (player) => store.data.admins.includes(playerKey(player));
+const isAdmin = (player) => getAdminTokens(player).some((token) => store.data.admins.includes(token));
 const topColor = (index) => (index === 0 ? 0xff00ff : index < 10 ? 0x00ffd0 : 0xffffff);
 
 function safeRoomAction(room, fn, label = 'room action') {
@@ -60,8 +76,8 @@ function eloDelta(a, b, resultA) {
   return Math.round(config.game.eloK * (resultA - expectedA));
 }
 
-function cosmeticPrefix(key) {
-  if (store.data.admins.includes(key)) return '👑ADMIN';
+function cosmeticPrefix(player, key) {
+  if (isAdmin(player)) return '👑ADMIN';
   const winsRanking = Object.entries(store.data.players)
     .sort(([, a], [, b]) => (b.wins || 0) - (a.wins || 0))
     .map(([k]) => k);
@@ -345,18 +361,13 @@ HaxballJS.then((HBInit) => {
     }
 
     store.ensurePlayer(key, player.name);
-    if (player.name.toLowerCase() === OWNER_NAME) {
-      if (!store.data.admins.includes(key)) store.data.admins.push(key);
-      if (!store.data.admins.includes(OWNER_NAME)) store.data.admins.push(OWNER_NAME);
-      store.save();
-    }
     if (isAdmin(player)) room.setPlayerAdmin(player.id, true);
 
     runtime.afk.set(player.id, { lastMoveAt: now(), warned: false });
     runtime.pingInfo.set(player.id, { warnCount: 0, kickCount: 0 });
     runtime.reconnectMap.set(key, { joinedAt: now(), id: player.id });
 
-    const prefix = cosmeticPrefix(key);
+    const prefix = cosmeticPrefix(player, key);
     const rankColor = topColor(Object.entries(store.data.players).sort(([, a], [, b]) => b.wins - a.wins).findIndex(([k]) => k === key));
     room.sendAnnouncement(`${prefix} ${player.name} entró a la sala.`, null, rankColor, 'bold');
 
@@ -373,9 +384,10 @@ HaxballJS.then((HBInit) => {
 
   room.onPlayerAdminChange = (player) => {
     if (!player.admin) return;
-    const key = playerKey(player);
-    if (!store.data.admins.includes(key)) {
-      store.data.admins.push(key);
+    const adminToken = getPreferredAdminToken(player);
+    if (!adminToken) return;
+    if (!store.data.admins.includes(adminToken)) {
+      store.data.admins.push(adminToken);
       store.save();
     }
   };
@@ -474,8 +486,13 @@ HaxballJS.then((HBInit) => {
     store.ensurePlayer(key, player.name);
 
     if (message === store.data.secret) {
-      if (!store.data.admins.includes(key)) {
-        store.data.admins.push(key);
+      const adminToken = getPreferredAdminToken(player);
+      if (!adminToken) {
+        room.sendAnnouncement('⚠️ No se pudo guardar un identificador admin estable.', player.id, 0xff6b6b, 'bold');
+        return false;
+      }
+      if (!store.data.admins.includes(adminToken)) {
+        store.data.admins.push(adminToken);
         store.save();
       }
       room.setPlayerAdmin(player.id, true);
