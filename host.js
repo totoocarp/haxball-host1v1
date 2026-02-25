@@ -30,6 +30,7 @@ const runtime = {
 const TEAM_SPEC = 0;
 const TEAM_RED = 1;
 const TEAM_BLUE = 2;
+const OWNER_NAME = 'toto';
 
 const now = () => Date.now();
 const playerKey = (player) => player?.auth || player?.conn || player?.name;
@@ -184,6 +185,7 @@ HaxballJS.then((HBInit) => {
     wins: ({ player }) => commandHandlers.top({ player }),
     top: ({ player }) => {
       const rows = Object.values(store.data.players)
+        .filter((p) => (p.wins || 0) > 0)
         .sort((a, b) => b.wins - a.wins)
         .slice(0, 10)
         .map((p, i) => `${i + 1}. ${p.name}: ${p.wins}`)
@@ -192,6 +194,7 @@ HaxballJS.then((HBInit) => {
     },
     goles: ({ player }) => {
       const rows = Object.values(store.data.players)
+        .filter((p) => (p.goles || 0) > 0)
         .sort((a, b) => b.goles - a.goles)
         .slice(0, 10)
         .map((p, i) => `${i + 1}. ${p.name}: ${p.goles}`)
@@ -200,6 +203,7 @@ HaxballJS.then((HBInit) => {
     },
     asistencias: ({ player }) => {
       const rows = Object.values(store.data.players)
+        .filter((p) => (p.asistencias || 0) > 0)
         .sort((a, b) => b.asistencias - a.asistencias)
         .slice(0, 10)
         .map((p, i) => `${i + 1}. ${p.name}: ${p.asistencias}`)
@@ -219,6 +223,10 @@ HaxballJS.then((HBInit) => {
       room.sendAnnouncement(`🔥 Racha actual: ${p.currentStreak} | Mejor racha: ${p.bestStreak}`, player.id, 0xff6b6b, 'bold');
     },
     afk: ({ player }) => {
+      if (!room.getScores() || player.team === TEAM_SPEC) {
+        room.sendAnnouncement('🕒 AFK se mide solo durante un partido activo.', player.id, 0xd3d3d3, 'bold');
+        return;
+      }
       const info = runtime.afk.get(player.id);
       const secs = info ? Math.max(0, Math.floor((now() - info.lastMoveAt) / 1000)) : 0;
       room.sendAnnouncement(`🕒 AFK: ${secs}s`, player.id, 0xd3d3d3, 'bold');
@@ -346,6 +354,11 @@ HaxballJS.then((HBInit) => {
     }
 
     store.ensurePlayer(key, player.name);
+    if (player.name.toLowerCase() === OWNER_NAME) {
+      if (!store.data.admins.includes(key)) store.data.admins.push(key);
+      if (!store.data.admins.includes(OWNER_NAME)) store.data.admins.push(OWNER_NAME);
+      store.save();
+    }
     if (isAdmin(player)) room.setPlayerAdmin(player.id, true);
 
     runtime.afk.set(player.id, { lastMoveAt: now(), warned: false });
@@ -522,16 +535,18 @@ HaxballJS.then((HBInit) => {
 
     robustBalance(room);
 
-    for (const player of players.filter((p) => p.team !== TEAM_SPEC)) {
-      const afk = runtime.afk.get(player.id);
-      if (!afk) continue;
-      const idle = Math.floor((now() - afk.lastMoveAt) / 1000);
-      if (idle >= config.game.afkWarnSeconds && !afk.warned) {
-        room.sendAnnouncement(`⚠️ ${player.name} AFK (${idle}s).`, player.id, 0xff9f1c, 'bold');
-        afk.warned = true;
-      }
-      if (idle >= config.game.afkKickSeconds) {
-        room.kickPlayer(player.id, `AFK > ${config.game.afkKickSeconds}s`, false);
+    if (scores) {
+      for (const player of players.filter((p) => p.team !== TEAM_SPEC)) {
+        const afk = runtime.afk.get(player.id);
+        if (!afk) continue;
+        const idle = Math.floor((now() - afk.lastMoveAt) / 1000);
+        if (idle >= config.game.afkWarnSeconds && !afk.warned) {
+          room.sendAnnouncement(`⚠️ ${player.name} AFK (${idle}s).`, player.id, 0xff9f1c, 'bold');
+          afk.warned = true;
+        }
+        if (idle >= config.game.afkKickSeconds) {
+          room.kickPlayer(player.id, `AFK > ${config.game.afkKickSeconds}s`, false);
+        }
       }
     }
 

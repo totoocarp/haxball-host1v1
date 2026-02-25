@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 
 const DATA_FILE = path.join(__dirname, '..', 'data.json');
+const OWNER_NAME = 'toto';
 
 function defaultPlayerStats(name, baseElo) {
   return {
@@ -45,12 +46,19 @@ class DataStore {
       };
       this.ensureSecret();
       this.migrate();
+      this.ensureOwnerAdmin();
       this.save();
     } catch (error) {
       console.error('[DATA] Error leyendo data.json, regenerando:', error.message);
       this.ensureSecret();
       this.save();
     }
+  }
+
+  ensureOwnerAdmin() {
+    const admins = new Set(this.data.admins || []);
+    admins.add(OWNER_NAME);
+    this.data.admins = Array.from(admins);
   }
 
   migrate() {
