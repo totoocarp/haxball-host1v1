@@ -4,59 +4,64 @@ const path = require('path');
 const CONFIG_FILE = path.join(__dirname, '..', 'config.json');
 
 const defaultConfig = {
-  room: { name: '1v1 Gana Sigue', maxPlayers: 15, public: true, token: '' },
+  room: {
+    name: 'HaxBall 1v1 Win & Stay',
+    maxPlayers: 16,
+    public: false,
+    token: '',
+    geo: { code: 'US', lat: 37.7749, lon: -122.4194 }
+  },
   game: {
-    scoreLimit: 5,
-    timeLimit: 0,
+    scoreLimit: 3,
+    timeLimit: 3,
     maxTeamSize: 1,
-    afkWarnSeconds: 20,
-    afkKickSeconds: 35,
-    watchdogIntervalMs: 2000,
-    freezeSeconds: 14,
-    inactivityRestartSeconds: 45,
-    doubleTouchWindowMs: 1200,
-    commandCooldownMs: 900,
-    autoSaveIntervalMs: 120000,
-    lagPingThreshold: 220,
-    lagKickThreshold: 500,
-    lagWarnCount: 3,
-    lagKickCount: 6
+    autoStartDelayMs: 400,
+    loginCodeTtlMs: 10 * 60 * 1000
   },
-  features: {
-    enableElo: true,
-    baseElo: 1000,
-    eloK: 26,
-    maintenanceMode: false,
-    spectatorPriority: 'queue'
+  storage: {
+    file: 'data.json',
+    autosaveMs: 30_000
   },
-  links: { discord: '' },
-  security: { maxNameChangesPerMinute: 5, reconnectGraceSeconds: 45, maxChatLength: 160 }
+  discord: {
+    token: '',
+    clientId: '',
+    guildId: '',
+    adminBridgeChannelId: '',
+    inviteUrl: ''
+  },
+  style: {
+    defaultColor: 0xEAEAEA,
+    adminColor: 0xFFB347,
+    afkColor: 0xB0B0B0,
+    botColor: 0x71D5FF,
+    warningColor: 0xFF6B6B
+  }
 };
 
 function mergeDeep(target, source) {
-  const output = { ...target };
-  Object.keys(source || {}).forEach((key) => {
-    if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
-      output[key] = mergeDeep(target[key] || {}, source[key]);
+  const out = { ...target };
+  for (const [key, value] of Object.entries(source || {})) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      out[key] = mergeDeep(target[key] || {}, value);
     } else {
-      output[key] = source[key];
+      out[key] = value;
     }
-  });
-  return output;
+  }
+  return out;
 }
 
 function loadConfig() {
+  if (!fs.existsSync(CONFIG_FILE)) {
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(defaultConfig, null, 2));
+    return defaultConfig;
+  }
   try {
-    if (!fs.existsSync(CONFIG_FILE)) {
-      fs.writeFileSync(CONFIG_FILE, JSON.stringify(defaultConfig, null, 2));
-      return defaultConfig;
-    }
     const parsed = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
     return mergeDeep(defaultConfig, parsed);
   } catch (error) {
-    console.error('[CONFIG] Error cargando config, usando defaults:', error.message);
+    console.error('[CONFIG] Error parsing config.json. Using defaults.', error);
     return defaultConfig;
   }
 }
 
-module.exports = { loadConfig, CONFIG_FILE };
+module.exports = { CONFIG_FILE, defaultConfig, loadConfig };

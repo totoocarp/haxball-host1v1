@@ -1,20 +1,87 @@
-# haxball-host1v1
+# HaxBall Host 1v1 + Discord Bot
 
-Host avanzado de Haxball 1v1 "Gana y Sigue" en Node.js, con watchdog, anti-bug y sistema de estadísticas/ELO.
+Sistema modular para Headless Host 1v1 con:
+
+- Autoasignación de equipos
+- Modo **gana y sigue** + rotación automática
+- Elo con brackets Top Alto / Top Bajo + bonus por win streak
+- Persistencia por identificador estable (`auth` de HaxBall y `discordId`)
+- Vinculación cruzada HaxBall ↔ Discord con códigos temporales
+- Chat limpio (todos los mensajes se eliminan y se reenvían por `sendAnnouncement`)
+- Puente de chat HaxBall → canal admin de Discord y viceversa
+
+## Estructura modular
+
+- `host.js`: orquestación principal del host y reglas de juego.
+- `src/config.js`: configuración y defaults.
+- `src/storage/dataStore.js`: persistencia JSON e índices de identidad.
+- `src/services/eloService.js`: reglas de ELO.
+- `src/services/linkService.js`: registro/vinculación por código.
+- `src/services/discordBot.js`: bot de Discord + slash commands + chat bridge.
 
 ## Requisitos
 
 - Node.js 18+
-- Token de Headless Host de Haxball (`HAXBALL_TOKEN` o `config.json`)
+- Token de HaxBall Headless (`HAXBALL_TOKEN`)
+- Token de bot Discord
 
 ## Configuración
 
-Editar `config.json` para personalizar:
+Crear/editar `config.json` (se autogenera con defaults):
 
-- Parámetros de sala (nombre, tamaño, geolocalización).
-- Reglas de watchdog/AFK/lag.
-- Activar/desactivar ELO.
-- Links y modo mantenimiento.
+- `room.*`: sala HaxBall
+- `game.scoreLimit = 3`, `game.timeLimit = 3`
+- `discord.token`, `discord.clientId`, `discord.guildId`, `discord.adminBridgeChannelId`
+- `discord.inviteUrl` para `!discord`
+
+El archivo `stadium.hbs` debe estar junto a `host.js`.
+
+## Comandos HaxBall
+
+- `!help`
+- `!afk`
+- `!me`
+- `!stats`
+- `!top`
+- `!wins`
+- `!winstreak`
+- `!discord` / `!ds`
+- `!register`
+- `!login <CODIGO>`
+
+## Comandos Discord (slash)
+
+Públicos:
+
+- `/me`
+- `/stats`
+- `/register`
+- `/login code:<CODIGO>`
+- `/top`
+- `/wins`
+- `/winstreak`
+
+Admin (placeholder para integración de moderación en host):
+
+- `/ban user`
+- `/unban user`
+- `/banip user`
+
+## Flujo de vinculación
+
+### Método Discord → HaxBall
+
+1. Usuario ejecuta `/register` en Discord.
+2. Recibe `!login ABCD1234`.
+3. Lo ejecuta en HaxBall.
+4. Cuenta vinculada.
+
+### Método HaxBall → Discord
+
+1. Usuario ejecuta `!register` en HaxBall.
+2. Recibe `/login ABCD1234`.
+3. Lo ejecuta en Discord.
+4. Cuenta vinculada.
 
 ## Ejecutar
 
@@ -22,45 +89,3 @@ Editar `config.json` para personalizar:
 npm install
 HAXBALL_TOKEN=tu_token node host.js
 ```
-
-## Comandos públicos
-
-- `!help`
-- `!stats`
-- `!perfil [id|name]`
-- `!rank`
-- `!elo`
-- `!top`
-- `!wins`
-- `!goles`
-- `!racha`
-- `!afk`
-- `!ping`
-- `!historial`
-- `!discord`
-
-## Comandos admin
-
-- `!forcestart`
-- `!forceend`
-- `!setwins <id|name> <wins>`
-- `!resetstats <id|name>`
-- `!mute <id|name>`
-- `!unmute <id|name>`
-- `!clearchat`
-- `!setelo <id|name> <elo>`
-- `!reloadconfig`
-- `!restart`
-- `!ban <id|name> [motivo]`
-- `!unban <player_key>`
-- `!modo mantenimiento [motivo]`
-- `!modo normal`
-- `!season [id]`
-
-## Resiliencia implementada
-
-- Auto-balance y auto-start robusto.
-- Watchdog de pelota freezeada + inactividad.
-- Anti-AFK y control de lag extremo.
-- Guardado atómico y autosave.
-- Captura de errores global (`uncaughtException`, `unhandledRejection`).
