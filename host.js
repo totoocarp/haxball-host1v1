@@ -1,186 +1,235 @@
 const fs = require('fs');
 const path = require('path');
 const HaxballJS = require('haxball.js');
-const { loadConfig, CONFIG_FILE } = require('./src/config');
-const { DataStore } = require('./src/dataStore');
-
-const STADIUM_FILE = path.join(__dirname, 'stadium.hbs');
-
-const config = loadConfig();
-const store = new DataStore(config.features.baseElo);
-store.load();
-
-const runtime = {
-  queue: [],
-  afk: new Map(),
-  reconnectMap: new Map(),
-  commandCooldown: new Map(),
-  muteSet: new Set(),
-  pingInfo: new Map(),
-  nameChangeLog: new Map(),
-  touchWindow: { active: false, team: null, at: 0, playerId: null },
-  ball: { lastPos: null, lastMoveAt: Date.now() },
-  lastGameActivityAt: Date.now(),
-  maintenanceReason: '',
-  lastKickerId: null,
-  secondKickerId: null,
-  autoSaveTimer: null,
-  watchdogTimer: null
-};
+const { loadConfig } = require('./src/config');
+const { DataStore } = require('./src/storage/dataStore');
+const { LinkService } = require('./src/services/linkService');
+const { DiscordBotService } = require('./src/services/discordBot');
+const { eloChange, streakBonus } = require('./src/services/eloService');
 
 const TEAM_SPEC = 0;
 const TEAM_RED = 1;
 const TEAM_BLUE = 2;
 
-function getAdminTokens(player) {
-  const tokens = [];
-  if (typeof player?.id === 'number') tokens.push(`id:${player.id}`);
-  if (player?.auth) tokens.push(`auth:${player.auth}`);
-  if (player?.conn) tokens.push(`conn:${player.conn}`);
-  if (player?.ip) tokens.push(`ip:${player.ip}`);
-  return tokens;
+const config = loadConfig();
+config.game.baseElo ||= 1000;
+
+const store = new DataStore(config);
+store.load();
+const linkService = new LinkService(store, config.game.loginCodeTtlMs);
+const discord = new DiscordBotService(config, store, linkService);
+
+const runtime = {
+  afk: new Set(),
+  room: null,
+  touchLog: [],
+  currentMatch: null
+};
+
+function adminByPlayer(player) {
+  return Boolean(player.admin);
 }
 
-function getPreferredAdminToken(player) {
-  if (player?.auth) return `auth:${player.auth}`;
-  if (player?.conn) return `conn:${player.conn}`;
-  if (player?.ip) return `ip:${player.ip}`;
-  if (typeof player?.id === 'number') return `id:${player.id}`;
-  return null;
+function prefixFor(playerEntity) {
+  const all = store.getTopBy('elo', 200);
+  const idx = all.findIndex((p) => p.id === playerEntity.id);
+  const rankTag = idx === -1 ? '#--' : `#${idx + 1}`;
+  const afkTag = runtime.afk.has(playerEntity.id) ? '[AFK] ' : '';
+  return `${afkTag}${rankTag}`;
 }
 
-const now = () => Date.now();
-const playerKey = (player) => player?.auth || player?.conn || player?.name;
-const isAdmin = (player) => getAdminTokens(player).some((token) => store.data.admins.includes(token));
-const topColor = (index) => (index === 0 ? 0xff00ff : index < 10 ? 0x00ffd0 : 0xffffff);
+function announce(room, msg, targetId = null, color = config.style.defaultColor, style = 'normal') {
+  room.sendAnnouncement(msg, targetId, color, style);
+  discord.sendBridge(msg).catch(() => null);
+}
 
-function safeRoomAction(room, fn, label = 'room action') {
-  try {
-    return fn();
-  } catch (error) {
-    console.error(`[SAFE] ${label} failed:`, error.message);
-    room.sendAnnouncement(`⚠️ Error interno en ${label}.`, null, 0xff3333, 'bold');
-    return null;
+function ensurePlayerEntity(player) {
+  return store.ensureByAuth(player.auth || `guest:${player.name}`, player.name);
+}
+
+function activePlayers(room) {
+  return room.getPlayerList().filter((p) => p.id !== 0 && p.team !== TEAM_SPEC);
+}
+
+function spectators(room) {
+  return room.getPlayerList().filter((p) => p.id !== 0 && p.team === TEAM_SPEC);
+}
+
+function assignTeams(room) {
+  const players = room.getPlayerList().filter((p) => p.id !== 0);
+  const red = players.filter((p) => p.team === TEAM_RED);
+  const blue = players.filter((p) => p.team === TEAM_BLUE);
+
+  for (const p of players.filter((x) => x.team === TEAM_SPEC)) {
+    const rc = room.getPlayerList().filter((x) => x.team === TEAM_RED).length;
+    const bc = room.getPlayerList().filter((x) => x.team === TEAM_BLUE).length;
+    if (rc < 1 || bc < 1) room.setPlayerTeam(p.id, rc <= bc ? TEAM_RED : TEAM_BLUE);
   }
+
+  if (red.length > 1) room.setPlayerTeam(red[1].id, TEAM_SPEC);
+  if (blue.length > 1) room.setPlayerTeam(blue[1].id, TEAM_SPEC);
 }
 
-function getSeasonStats(playerStats) {
-  const seasonId = store.data.season?.id || 'S1';
-  if (!playerStats.seasons[seasonId]) {
-    playerStats.seasons[seasonId] = { wins: 0, matches: 0, losses: 0, streak: 0, bestStreak: 0 };
+function syncMatchMode(room) {
+  const actives = activePlayers(room);
+  if (actives.length <= 1) {
+    room.setScoreLimit(0);
+    room.setTimeLimit(0);
+    if (!room.getScores()) room.startGame();
+    runtime.currentMatch = null;
+    return;
   }
-  return playerStats.seasons[seasonId];
+
+  room.setScoreLimit(config.game.scoreLimit);
+  room.setTimeLimit(config.game.timeLimit);
+  if (!room.getScores()) setTimeout(() => room.startGame(), config.game.autoStartDelayMs);
 }
 
-function eloDelta(a, b, resultA) {
-  const expectedA = 1 / (1 + 10 ** ((b - a) / 400));
-  return Math.round(config.game.eloK * (resultA - expectedA));
+function registerGoal(team) {
+  if (!runtime.currentMatch) return;
+  const scorer = runtime.touchLog[runtime.touchLog.length - 1];
+  const assister = runtime.touchLog[runtime.touchLog.length - 2];
+  if (!scorer) return;
+
+  runtime.currentMatch.goals[scorer.pid] = (runtime.currentMatch.goals[scorer.pid] || 0) + 1;
+  if (assister && assister.pid !== scorer.pid) {
+    runtime.currentMatch.assists[assister.pid] = (runtime.currentMatch.assists[assister.pid] || 0) + 1;
+  }
+  runtime.currentMatch.lastGoalTeam = team;
 }
 
-function cosmeticPrefix(player, key) {
-  if (isAdmin(player)) return '👑ADMIN';
-  const winsRanking = Object.entries(store.data.players)
-    .filter(([, p]) => (p.wins || 0) > 0)
-    .sort(([, a], [, b]) => (b.wins || 0) - (a.wins || 0))
-    .map(([k]) => k);
-  const idx = winsRanking.indexOf(key);
-  if (idx === 0) return '🥇TOP1';
-  if (idx > -1 && idx < 10) return '🏅TOP10';
-  return '🎮';
+function rankByElo(playerId) {
+  const list = store.getTopBy('elo', 9999);
+  const idx = list.findIndex((p) => p.id === playerId);
+  return idx === -1 ? 9999 : idx + 1;
 }
 
-function resolvePlayerKey(player) {
-  const candidates = [player?.auth, player?.conn, player?.name].filter(Boolean);
-  return candidates.find((key) => !!store.data.players[key]) || candidates[0] || null;
+function applyMatchResult(winnerPid, loserPid, options = { disconnect: false }) {
+  const winner = store.getPlayer(winnerPid);
+  const loser = store.getPlayer(loserPid);
+  if (!winner || !loser) return;
+
+  winner.stats.matches += 1;
+  loser.stats.matches += 1;
+  winner.stats.wins += 1;
+  loser.stats.losses += 1;
+
+  winner.stats.winStreak += 1;
+  winner.stats.bestWinStreak = Math.max(winner.stats.bestWinStreak, winner.stats.winStreak);
+  loser.stats.winStreak = 0;
+
+  const deltas = eloChange({ winnerRank: rankByElo(winner.id), loserRank: rankByElo(loser.id) });
+  const bonus = streakBonus(winner.stats.winStreak);
+  winner.stats.elo += deltas.winner + bonus;
+  loser.stats.elo += deltas.loser;
+
+  if (!options.disconnect && runtime.currentMatch) {
+    for (const [pid, g] of Object.entries(runtime.currentMatch.goals)) {
+      const p = store.getPlayer(pid);
+      if (p) p.stats.goals += g;
+    }
+    for (const [pid, a] of Object.entries(runtime.currentMatch.assists)) {
+      const p = store.getPlayer(pid);
+      if (p) p.stats.assists += a;
+    }
+  }
+
+  store.save();
 }
 
-function getPlayerStats(player) {
-  const key = resolvePlayerKey(player);
-  if (!key) return null;
-  return store.ensurePlayer(key, player.name);
+function rotate(room, winnerTeam) {
+  const players = room.getPlayerList().filter((p) => p.id !== 0);
+  const winner = players.find((p) => p.team === winnerTeam);
+  const loser = players.find((p) => p.team !== TEAM_SPEC && p.team !== winnerTeam);
+  const wait = players.filter((p) => p.team === TEAM_SPEC);
+  if (!winner) return;
+  room.setPlayerTeam(winner.id, TEAM_RED);
+
+  const challenger = wait[0] || loser;
+  if (challenger) room.setPlayerTeam(challenger.id, TEAM_BLUE);
+  if (loser && challenger && loser.id !== challenger.id) room.setPlayerTeam(loser.id, TEAM_SPEC);
 }
 
-function sendProfile(room, player, targetStats) {
-  const wr = targetStats.matches > 0 ? ((targetStats.wins / targetStats.matches) * 100).toFixed(1) : '0.0';
-  room.sendAnnouncement(
-    `${targetStats.name} | ELO ${targetStats.elo} | WR ${wr}% | Wins ${targetStats.wins} | Racha ${targetStats.currentStreak} | Mejor racha ${targetStats.bestStreak}`,
+function sendHelp(room, player) {
+  announce(
+    room,
+    'Comandos: !help !afk !me !stats !top !wins !winstreak !discord/!ds !register !login <código>',
     player.id,
-    0x7bdff2,
+    config.style.botColor,
     'bold'
   );
 }
 
-function parseTarget(room, argument) {
-  if (!argument) return null;
-  const byId = Number(argument);
-  const players = room.getPlayerList().filter((p) => p.id !== 0);
-  if (!Number.isNaN(byId)) return players.find((p) => p.id === byId) || null;
-  return players.find((p) => p.name.toLowerCase() === argument.toLowerCase()) || null;
+function sendPlayerStats(room, requester, target) {
+  if (!target.linked) {
+    announce(room, 'Tus stats existen pero son privadas hasta vincular tu cuenta.', requester.id, config.style.warningColor, 'bold');
+    return;
+  }
+  const s = target.stats;
+  announce(room, `${target.displayName} | ELO ${s.elo} | PJ ${s.matches} | W ${s.wins} | L ${s.losses} | G ${s.goals} | A ${s.assists} | WS ${s.winStreak}`, requester.id, config.style.botColor, 'bold');
 }
 
-function robustBalance(room) {
-  const players = room.getPlayerList().filter((p) => p.id !== 0);
-  const reds = players.filter((p) => p.team === TEAM_RED);
-  const blues = players.filter((p) => p.team === TEAM_BLUE);
-  const specs = players.filter((p) => p.team === TEAM_SPEC);
+function handleCommand(room, player, raw) {
+  const [cmd, ...args] = raw.trim().split(/\s+/);
+  const lc = cmd.toLowerCase();
+  const entity = ensurePlayerEntity(player);
 
-  for (const player of specs) {
-    const redCount = room.getPlayerList().filter((p) => p.team === TEAM_RED).length;
-    const blueCount = room.getPlayerList().filter((p) => p.team === TEAM_BLUE).length;
-    if (redCount < config.game.maxTeamSize || blueCount < config.game.maxTeamSize) {
-      const team = redCount <= blueCount ? TEAM_RED : TEAM_BLUE;
-      room.setPlayerTeam(player.id, team);
-      runtime.queue = runtime.queue.filter((id) => id !== player.id);
+  if (lc === '!help') return sendHelp(room, player);
+
+  if (lc === '!afk') {
+    if (runtime.afk.has(entity.id)) {
+      runtime.afk.delete(entity.id);
+      announce(room, `🟢 ${player.name} ya no está AFK.`, null, config.style.botColor, 'bold');
+    } else {
+      runtime.afk.add(entity.id);
+      announce(room, `🟡 ${player.name} está AFK.`, null, config.style.afkColor, 'bold');
     }
+    return;
   }
 
-  const updated = room.getPlayerList();
-  if (updated.filter((p) => p.team === TEAM_RED).length > config.game.maxTeamSize) {
-    room.setPlayerTeam(updated.find((p) => p.team === TEAM_RED).id, TEAM_SPEC);
-  }
-  if (updated.filter((p) => p.team === TEAM_BLUE).length > config.game.maxTeamSize) {
-    room.setPlayerTeam(updated.find((p) => p.team === TEAM_BLUE).id, TEAM_SPEC);
-  }
+  if (lc === '!me' || lc === '!stats') return sendPlayerStats(room, player, entity);
 
-  const scores = room.getScores();
-  const enoughPlayers =
-    room.getPlayerList().filter((p) => p.team === TEAM_RED).length === config.game.maxTeamSize &&
-    room.getPlayerList().filter((p) => p.team === TEAM_BLUE).length === config.game.maxTeamSize;
-
-  if (!scores && enoughPlayers) {
-    setTimeout(() => {
-      if (!room.getScores()) room.startGame();
-    }, 400);
+  if (lc === '!top') {
+    const top = store.getTopBy('elo', 10).map((p, i) => `${i + 1}. ${p.displayName} (${p.stats.elo})`).join(' | ') || 'Sin datos';
+    announce(room, `🏆 TOP ELO: ${top}`, player.id, config.style.botColor, 'bold');
+    return;
   }
 
-  if (scores && !enoughPlayers) {
-    room.stopGame();
-    room.sendAnnouncement('⏹ Partido pausado por falta de jugadores.', null, 0xff4444, 'bold');
+  if (lc === '!wins') {
+    const top = store.getTopBy('wins', 10).map((p, i) => `${i + 1}. ${p.displayName} (${p.stats.wins})`).join(' | ') || 'Sin datos';
+    announce(room, `🥇 TOP WINS: ${top}`, player.id, config.style.botColor, 'bold');
+    return;
+  }
+
+  if (lc === '!winstreak') {
+    const top = store.getTopBy('bestWinStreak', 10).map((p, i) => `${i + 1}. ${p.displayName} (${p.stats.bestWinStreak})`).join(' | ') || 'Sin datos';
+    announce(room, `🔥 TOP WS: ${top}`, player.id, config.style.botColor, 'bold');
+    return;
+  }
+
+  if (lc === '!discord' || lc === '!ds') {
+    announce(room, config.discord.inviteUrl || 'Discord no configurado.', player.id, config.style.botColor, 'bold');
+    return;
+  }
+
+  if (lc === '!register') {
+    const c = linkService.createFromHax(player.auth || `guest:${player.name}`, player.name);
+    announce(room, `Código generado. Ejecuta en Discord: /login ${c}`, player.id, config.style.botColor, 'bold');
+    return;
+  }
+
+  if (lc === '!login') {
+    const c = (args[0] || '').toUpperCase();
+    if (!c) {
+      announce(room, 'Uso: !login ABCD1234', player.id, config.style.warningColor, 'bold');
+      return;
+    }
+    const res = linkService.consumeInHax(c, player.auth || `guest:${player.name}`, player.name);
+    announce(room, res.ok ? '✅ Cuenta vinculada correctamente.' : `❌ ${res.reason}`, player.id, res.ok ? config.style.botColor : config.style.warningColor, 'bold');
   }
 }
 
-function rotateAfterVictory(room, winnerTeam) {
-  const players = room.getPlayerList().filter((p) => p.id !== 0);
-  const winner = players.find((p) => p.team === winnerTeam);
-  const loser = players.find((p) => p.team !== winnerTeam && p.team !== TEAM_SPEC);
-  const waiting = players.filter((p) => p.team === TEAM_SPEC);
-  if (!winner) return robustBalance(room);
-
-  room.setPlayerTeam(winner.id, TEAM_RED);
-  const nextPlayer = waiting[0] || loser;
-  if (nextPlayer) room.setPlayerTeam(nextPlayer.id, TEAM_BLUE);
-  if (loser && nextPlayer && loser.id !== nextPlayer.id) room.setPlayerTeam(loser.id, TEAM_SPEC);
-
-  for (const spec of waiting.slice(1)) {
-    room.setPlayerTeam(spec.id, TEAM_SPEC);
-  }
-
-  setTimeout(() => {
-    if (!room.getScores()) robustBalance(room);
-  }, 500);
-}
-
-HaxballJS.then((HBInit) => {
+HaxballJS.then(async (HBInit) => {
   const room = HBInit({
     roomName: config.room.name,
     maxPlayers: config.room.maxPlayers,
@@ -190,486 +239,105 @@ HaxballJS.then((HBInit) => {
     geo: config.room.geo
   });
 
-  const stadium = fs.readFileSync(STADIUM_FILE, 'utf8');
+  runtime.room = room;
+  const stadium = fs.readFileSync(path.join(__dirname, 'stadium.hbs'), 'utf8');
   room.setCustomStadium(stadium);
   room.setScoreLimit(config.game.scoreLimit);
   room.setTimeLimit(config.game.timeLimit);
 
-  room.onRoomLink = (link) => console.log('[ROOM]', link);
+  room.onRoomLink = (link) => console.log('[ROOM LINK]', link);
 
-  const commandHandlers = {
-    help: ({ player }) => {
-      room.sendAnnouncement(
-        '📘 Públicos: !stats !rank !elo !top !racha !afk !ping !historial !perfil !wins !goles !discord\n🔒 Admin: !forcestart !forceend !setwins !resetstats !mute !unmute !clearchat !setelo !reloadconfig !restart !ban !unban !modo !season',
-        player.id,
-        0xffffff,
-        'bold'
-      );
-    },
-    stats: ({ player }) => {
-      const stats = getPlayerStats(player);
-      if (!stats) return;
-      sendProfile(room, player, stats);
-    },
-    perfil: ({ player, args }) => {
-      const target = parseTarget(room, args[0]) || player;
-      const targetStats = getPlayerStats(target);
-      if (!targetStats) return;
-      sendProfile(room, player, targetStats);
-    stats: ({ player }) => sendProfile(room, player, store.data.players[playerKey(player)]),
-    perfil: ({ player, args }) => {
-      const target = parseTarget(room, args[0]) || player;
-      sendProfile(room, player, store.data.players[playerKey(target)]);
-    },
-    wins: ({ player }) => commandHandlers.top({ player }),
-    top: ({ player }) => {
-      const rows = Object.values(store.data.players)
-        .filter((p) => (p.wins || 0) > 0)
-        .sort((a, b) => b.wins - a.wins)
-        .slice(0, 10)
-        .map((p, i) => `${i + 1}. ${p.name}: ${p.wins}`)
-        .join('\n');
-      room.sendAnnouncement(`🏆 Top Wins\n${rows || 'Sin datos'}`, player.id, 0xffd700, 'bold');
-    },
-    goles: ({ player }) => {
-      const rows = Object.values(store.data.players)
-        .filter((p) => (p.goles || 0) > 0)
-        .sort((a, b) => b.goles - a.goles)
-        .slice(0, 10)
-        .map((p, i) => `${i + 1}. ${p.name}: ${p.goles}`)
-        .join('\n');
-      room.sendAnnouncement(`⚽ Top Goles\n${rows || 'Sin datos'}`, player.id, 0xff763d, 'bold');
-    },
-    rank: ({ player }) => {
-      const key = playerKey(player);
-      const ranking = Object.entries(store.data.players)
-        .sort(([, a], [, b]) => b.elo - a.elo)
-        .map(([k]) => k);
-      room.sendAnnouncement(`📊 Tu rank ELO: #${ranking.indexOf(key) + 1}`, player.id, 0x7bdff2, 'bold');
-    },
-    elo: ({ player }) => room.sendAnnouncement(`⭐ ELO actual: ${store.data.players[playerKey(player)].elo}`, player.id, 0x7bdff2, 'bold'),
-    racha: ({ player }) => {
-      const p = getPlayerStats(player);
-      if (!p) return;
-      room.sendAnnouncement(`🔥 Racha actual: ${p.currentStreak} | Mejor racha: ${p.bestStreak}`, player.id, 0xff6b6b, 'bold');
-    },
-    afk: ({ player }) => {
-      if (!room.getScores() || player.team === TEAM_SPEC) {
-        room.sendAnnouncement('🕒 AFK se mide solo durante un partido activo.', player.id, 0xd3d3d3, 'bold');
-        return;
-      }
-      const info = runtime.afk.get(player.id);
-      const secs = info ? Math.max(0, Math.floor((now() - info.lastMoveAt) / 1000)) : 0;
-      room.sendAnnouncement(`🕒 AFK: ${secs}s`, player.id, 0xd3d3d3, 'bold');
-    },
-    ping: ({ player }) => {
-      const ping = room.getPlayer(player.id)?.ping || 0;
-      room.sendAnnouncement(`📡 Ping: ${ping}ms`, player.id, ping > config.game.lagPingThreshold ? 0xff9f1c : 0x2ec4b6, 'bold');
-    },
-    historial: ({ player }) => {
-      const p = getPlayerStats(player);
-      if (!p) return;
-      const season = getSeasonStats(p);
-      room.sendAnnouncement(`📚 Temp ${store.data.season.id}: ${season.wins}W/${season.losses}L (${season.matches} PJ)`, player.id, 0xbde0fe, 'bold');
-    },
-    discord: ({ player }) => room.sendAnnouncement(`Discord: ${config.links.discord}`, player.id, 0x7289da, 'bold'),
-    forcestart: ({ player }) => {
-      if (!isAdmin(player)) return room.sendAnnouncement('Solo admin.', player.id, 0xff3333, 'bold');
-      robustBalance(room);
-      if (!room.getScores()) room.startGame();
-    },
-    forceend: ({ player }) => {
-      if (!isAdmin(player)) return room.sendAnnouncement('Solo admin.', player.id, 0xff3333, 'bold');
-      if (room.getScores()) room.stopGame();
-    },
-    setwins: ({ player, args }) => {
-      if (!isAdmin(player)) return;
-      const target = parseTarget(room, args[0]);
-      const value = Number(args[1]);
-      if (!target || Number.isNaN(value) || value < 0) return room.sendAnnouncement('Uso: !setwins <id|name> <n>', player.id, 0xff3333, 'bold');
-      store.data.players[playerKey(target)].wins = value;
-      store.save();
-    },
-    resetstats: ({ player, args }) => {
-      if (!isAdmin(player)) return;
-      const target = parseTarget(room, args[0]);
-      if (!target) return;
-      const p = getPlayerStats(target);
-      if (!p) return;
-      Object.assign(p, { goles: 0, wins: 0, matches: 0, losses: 0, draws: 0, currentStreak: 0, bestStreak: 0, elo: config.features.baseElo });
-      store.save();
-    },
-    mute: ({ player, args }) => {
-      if (!isAdmin(player)) return;
-      const target = parseTarget(room, args[0]);
-      if (!target) return;
-      runtime.muteSet.add(playerKey(target));
-      room.sendAnnouncement(`🔇 ${target.name} silenciado`, null, 0xffcc00, 'bold');
-    },
-    unmute: ({ player, args }) => {
-      if (!isAdmin(player)) return;
-      const target = parseTarget(room, args[0]);
-      if (!target) return;
-      runtime.muteSet.delete(playerKey(target));
-      room.sendAnnouncement(`🔊 ${target.name} habilitado`, null, 0x44dd88, 'bold');
-    },
-    clearchat: ({ player }) => {
-      if (!isAdmin(player)) return;
-      for (let i = 0; i < 18; i += 1) room.sendAnnouncement(' ', null, 0xffffff, 'normal');
-    },
-    setelo: ({ player, args }) => {
-      if (!isAdmin(player)) return;
-      const target = parseTarget(room, args[0]);
-      const value = Number(args[1]);
-      if (!target || Number.isNaN(value)) return;
-      const targetStats = getPlayerStats(target);
-      if (!targetStats) return;
-      targetStats.elo = value;
-      store.save();
-    },
-    reloadconfig: ({ player }) => {
-      if (!isAdmin(player)) return;
-      Object.assign(config, loadConfig());
-      room.sendAnnouncement('♻️ Config recargada.', null, 0x9bf6ff, 'bold');
-    },
-    restart: ({ player }) => {
-      if (!isAdmin(player)) return;
-      if (room.getScores()) room.stopGame();
-      robustBalance(room);
-      room.sendAnnouncement('🔁 Reinicio operativo completado.', null, 0x9bf6ff, 'bold');
-    },
-    ban: ({ player, args }) => {
-      if (!isAdmin(player)) return;
-      const target = parseTarget(room, args[0]);
-      if (!target) return;
-      const key = playerKey(target);
-      store.data.bans[key] = { reason: args.slice(1).join(' ') || 'Sin razón', by: player.name, at: now() };
-      store.save();
-      room.kickPlayer(target.id, `Baneado: ${store.data.bans[key].reason}`, true);
-    },
-    unban: ({ player, args }) => {
-      if (!isAdmin(player)) return;
-      const targetKey = args.join(' ');
-      if (!targetKey || !store.data.bans[targetKey]) return;
-      delete store.data.bans[targetKey];
-      store.save();
-      room.sendAnnouncement(`✅ Unban: ${targetKey}`, player.id, 0x66ff99, 'bold');
-    },
-    modo: ({ player, args }) => {
-      if (!isAdmin(player)) return;
-      const mode = (args[0] || '').toLowerCase();
-      if (mode === 'mantenimiento') {
-        config.features.maintenanceMode = true;
-        runtime.maintenanceReason = args.slice(1).join(' ') || 'Mantenimiento';
-      } else if (mode === 'normal') {
-        config.features.maintenanceMode = false;
-        runtime.maintenanceReason = '';
-      }
-      room.sendAnnouncement(`🛠 Modo: ${config.features.maintenanceMode ? 'mantenimiento' : 'normal'}`, null, 0xffafcc, 'bold');
-    },
-    season: ({ player, args }) => {
-      if (!isAdmin(player)) return;
-      const nextId = args[0] || `S${Number((store.data.season?.id || 'S1').slice(1)) + 1}`;
-      store.data.season = { id: nextId, startedAt: now() };
-      store.save();
-      room.sendAnnouncement(`📅 Nueva temporada: ${nextId}`, null, 0xcaffbf, 'bold');
-    }
+  discord.setBridgeHandler((text) => announce(room, text, null, config.style.adminColor, 'bold'));
+  await discord.start();
+
+  room.onPlayerJoin = (player) => {
+    const entity = ensurePlayerEntity(player);
+    assignTeams(room);
+    syncMatchMode(room);
+    announce(room, `+ ${player.name} entró.`, null, config.style.botColor, 'bold');
+    const message = entity.linked ? 'Cuenta vinculada detectada ✅' : 'Tu cuenta no está vinculada. Usa !register';
+    announce(room, message, player.id, config.style.botColor, 'normal');
   };
 
-  room.onPlayerJoin = (player) => safeRoomAction(room, () => {
-    const key = playerKey(player);
-    if (!key) return room.kickPlayer(player.id, 'No se pudo validar identidad.', false);
-    if (config.features.maintenanceMode && !isAdmin(player)) {
-      room.kickPlayer(player.id, `Sala en mantenimiento: ${runtime.maintenanceReason || 'intenta luego'}`, false);
-      return;
+  room.onPlayerLeave = (player) => {
+    const leavingEntity = ensurePlayerEntity(player);
+    if (runtime.currentMatch && runtime.currentMatch.counted) {
+      const pids = runtime.currentMatch.pids;
+      if (pids.includes(leavingEntity.id)) {
+        const winnerPid = pids.find((id) => id !== leavingEntity.id);
+        applyMatchResult(winnerPid, leavingEntity.id, { disconnect: true });
+        announce(room, `⚠️ ${player.name} se desconectó: cuenta como derrota.`, null, config.style.warningColor, 'bold');
+      }
     }
-    if (store.data.bans[key]) {
-      room.kickPlayer(player.id, `Baneado: ${store.data.bans[key].reason}`, false);
-      return;
-    }
-
-    store.ensurePlayer(key, player.name);
-    if (isAdmin(player)) room.setPlayerAdmin(player.id, true);
-
-    runtime.afk.set(player.id, { lastMoveAt: now(), warned: false });
-    runtime.pingInfo.set(player.id, { warnCount: 0, kickCount: 0 });
-    runtime.reconnectMap.set(key, { joinedAt: now(), id: player.id });
-
-    const prefix = cosmeticPrefix(player, key);
-    const rankColor = topColor(Object.entries(store.data.players).sort(([, a], [, b]) => b.wins - a.wins).findIndex(([k]) => k === key));
-    room.sendAnnouncement(`${prefix} ${player.name} entró a la sala.`, null, rankColor, 'bold');
-
-    robustBalance(room);
-  }, 'onPlayerJoin');
-
-  room.onPlayerLeave = (player) => safeRoomAction(room, () => {
-    runtime.afk.delete(player.id);
-    runtime.pingInfo.delete(player.id);
-    runtime.commandCooldown.delete(player.id);
-    runtime.queue = runtime.queue.filter((id) => id !== player.id);
-    robustBalance(room);
-  }, 'onPlayerLeave');
-
-  room.onPlayerAdminChange = (player) => {
-    if (!player.admin) return;
-    const adminToken = getPreferredAdminToken(player);
-    if (!adminToken) return;
-    if (!store.data.admins.includes(adminToken)) {
-      store.data.admins.push(adminToken);
-      store.save();
-    }
-  };
-
-  room.onPlayerActivity = (player) => {
-    const info = runtime.afk.get(player.id);
-    if (!info) return;
-    info.lastMoveAt = now();
-    info.warned = false;
-    if (player.team !== TEAM_SPEC && room.getScores()) {
-      runtime.lastGameActivityAt = now();
-    }
+    runtime.afk.delete(leavingEntity.id);
+    assignTeams(room);
+    syncMatchMode(room);
   };
 
   room.onPlayerBallKick = (player) => {
-    const scores = room.getScores();
-    if (runtime.touchWindow.active && now() - runtime.touchWindow.at < config.game.doubleTouchWindowMs) {
-      if (runtime.touchWindow.team === player.team && runtime.touchWindow.playerId !== player.id) {
-        room.sendAnnouncement(`🚫 Doble toque inicial no permitido (${player.name}).`, null, 0xff4d6d, 'bold');
-      }
-    }
-    runtime.secondKickerId = runtime.lastKickerId;
-    runtime.lastKickerId = player.id;
-    runtime.lastGameActivityAt = now();
-    if (scores && scores.time <= 2) {
-      runtime.touchWindow = { active: true, team: player.team, at: now(), playerId: player.id };
-    }
+    const entity = ensurePlayerEntity(player);
+    runtime.touchLog.push({ pid: entity.id, at: Date.now() });
+    if (runtime.touchLog.length > 8) runtime.touchLog.shift();
   };
 
-  room.onTeamGoal = () => {
-    const scorer = room.getPlayer(runtime.lastKickerId);
-    if (!scorer) return;
-    const scorerStats = getPlayerStats(scorer);
-    if (!scorerStats) return;
-    const scorerStats = store.data.players[playerKey(scorer)];
-    scorerStats.goles += 1;
-
-    runtime.touchWindow.active = false;
-    store.save();
-  };
-
-  room.onTeamVictory = (scores) => safeRoomAction(room, () => {
-    const winner = scores.red > scores.blue ? TEAM_RED : TEAM_BLUE;
-    const red = room.getPlayerList().find((p) => p.team === TEAM_RED);
-    const blue = room.getPlayerList().find((p) => p.team === TEAM_BLUE);
-
-    [red, blue].filter(Boolean).forEach((p) => {
-      const stats = getPlayerStats(p);
-      if (!stats) return;
-      const stats = store.data.players[playerKey(p)];
-      stats.matches += 1;
-      const season = getSeasonStats(stats);
-      season.matches += 1;
-
-      if (p.team === winner) {
-        stats.wins += 1;
-        stats.currentStreak += 1;
-        stats.bestStreak = Math.max(stats.bestStreak, stats.currentStreak);
-        season.wins += 1;
-        season.streak += 1;
-        season.bestStreak = Math.max(season.bestStreak, season.streak);
-      } else {
-        stats.losses += 1;
-        stats.currentStreak = 0;
-        season.losses += 1;
-        season.streak = 0;
-      }
-    });
-
-    if (config.features.enableElo && red && blue) {
-      const redStats = getPlayerStats(red);
-      const blueStats = getPlayerStats(blue);
-      if (!redStats || !blueStats) return;
-      const redStats = store.data.players[playerKey(red)];
-      const blueStats = store.data.players[playerKey(blue)];
-      const redRes = winner === TEAM_RED ? 1 : 0;
-      const delta = eloDelta(redStats.elo, blueStats.elo, redRes);
-      redStats.elo += delta;
-      blueStats.elo -= delta;
-    }
-
-    store.save();
-    rotateAfterVictory(room, winner);
-  }, 'onTeamVictory');
+  room.onTeamGoal = (team) => registerGoal(team);
 
   room.onGameStart = () => {
-    runtime.touchWindow.active = false;
-    runtime.ball.lastPos = null;
-    runtime.ball.lastMoveAt = now();
-    runtime.lastGameActivityAt = now();
-    room.getPlayerList().forEach((p) => {
-      const afk = runtime.afk.get(p.id);
-      if (afk) {
-        afk.lastMoveAt = now();
-        afk.warned = false;
+    const actives = activePlayers(room);
+    runtime.touchLog = [];
+
+    if (actives.length === 2) {
+      const a = ensurePlayerEntity(actives[0]);
+      const b = ensurePlayerEntity(actives[1]);
+      runtime.currentMatch = {
+        counted: true,
+        pids: [a.id, b.id],
+        goals: {},
+        assists: {}
+      };
+    } else {
+      runtime.currentMatch = null;
+    }
+  };
+
+  room.onGameStop = () => {
+    const scores = room.getScores();
+    if (runtime.currentMatch && scores) {
+      const players = activePlayers(room);
+      if (players.length === 2) {
+        const red = ensurePlayerEntity(players.find((p) => p.team === TEAM_RED));
+        const blue = ensurePlayerEntity(players.find((p) => p.team === TEAM_BLUE));
+        if (red && blue) {
+          const winnerPid = scores.red > scores.blue ? red.id : blue.id;
+          const loserPid = winnerPid === red.id ? blue.id : red.id;
+          applyMatchResult(winnerPid, loserPid, { disconnect: false });
+          rotate(room, scores.red > scores.blue ? TEAM_RED : TEAM_BLUE);
+        }
       }
-    });
+    }
+    runtime.currentMatch = null;
+    assignTeams(room);
+    syncMatchMode(room);
   };
 
   room.onPlayerChat = (player, message) => {
-    if (typeof message !== 'string') return false;
-    if (message.length > config.security.maxChatLength) {
-      room.sendAnnouncement('⚠️ Mensaje demasiado largo.', player.id, 0xff6b6b, 'bold');
+    const entity = ensurePlayerEntity(player);
+    if (message.startsWith('!')) {
+      handleCommand(room, player, message);
       return false;
     }
 
-    const key = playerKey(player);
-    store.ensurePlayer(key, player.name);
-
-    if (message === store.data.secret) {
-      const adminToken = getPreferredAdminToken(player);
-      if (!adminToken) {
-        room.sendAnnouncement('⚠️ No se pudo guardar un identificador admin estable.', player.id, 0xff6b6b, 'bold');
-        return false;
-      }
-      if (!store.data.admins.includes(adminToken)) {
-        store.data.admins.push(adminToken);
-        store.save();
-      }
-      room.setPlayerAdmin(player.id, true);
-      room.sendAnnouncement('👑 Admin otorgado.', player.id, 0x98f5e1, 'bold');
-      return false;
-    }
-
-    if (runtime.muteSet.has(key) && !isAdmin(player)) {
-      room.sendAnnouncement('🔇 Estás muteado.', player.id, 0xffcc00, 'bold');
-      return false;
-    }
-
-    if (!message.startsWith('!')) return true;
-
-    const cooldown = runtime.commandCooldown.get(player.id) || 0;
-    if (now() - cooldown < config.game.commandCooldownMs) return false;
-    runtime.commandCooldown.set(player.id, now());
-
-    const [commandRaw, ...args] = message.slice(1).trim().split(/\s+/);
-    const command = commandRaw?.toLowerCase();
-    const handler = commandHandlers[command];
-    if (!handler) {
-      room.sendAnnouncement('Comando no reconocido. Usa !help', player.id, 0xffadad, 'bold');
-      return false;
-    }
-
-    safeRoomAction(room, () => handler({ player, args }), `command:${command}`);
+    const prefix = prefixFor(entity);
+    const color = adminByPlayer(player) ? config.style.adminColor : config.style.defaultColor;
+    announce(room, `${prefix} ${player.name}: ${message}`, null, color, 'normal');
     return false;
   };
 
-  runtime.autoSaveTimer = setInterval(() => {
-    safeRoomAction(room, () => store.save(), 'autosave');
-  }, config.game.autoSaveIntervalMs);
-
-  runtime.watchdogTimer = setInterval(() => {
-    const scores = room.getScores();
-    const players = room.getPlayerList().filter((p) => p.id !== 0);
-
-    if (players.length === 0 && scores) {
-      room.stopGame();
-      return;
-    }
-
-    robustBalance(room);
-
-    if (scores) {
-      for (const player of players.filter((p) => p.team !== TEAM_SPEC)) {
-        const afk = runtime.afk.get(player.id);
-        if (!afk) continue;
-        const idle = Math.floor((now() - afk.lastMoveAt) / 1000);
-        if (idle >= config.game.afkWarnSeconds && !afk.warned) {
-          room.sendAnnouncement(`⚠️ ${player.name} AFK (${idle}s).`, player.id, 0xff9f1c, 'bold');
-          afk.warned = true;
-        }
-        if (idle >= config.game.afkKickSeconds) {
-          room.kickPlayer(player.id, `AFK > ${config.game.afkKickSeconds}s`, false);
-        }
-      }
-    }
-
-    for (const player of players) {
-      const ping = room.getPlayer(player.id)?.ping || 0;
-      const pingState = runtime.pingInfo.get(player.id);
-      if (!pingState) continue;
-      if (ping >= config.game.lagPingThreshold) pingState.warnCount += 1;
-      if (ping >= config.game.lagKickThreshold) pingState.kickCount += 1;
-
-      if (pingState.warnCount === config.game.lagWarnCount) {
-        room.sendAnnouncement(`📶 ${player.name}, tu ping es alto (${ping}ms).`, player.id, 0xffbe0b, 'bold');
-      }
-      if (pingState.kickCount >= config.game.lagKickCount) {
-        room.kickPlayer(player.id, `Lag extremo (${ping}ms)`, false);
-      }
-    }
-
-    if (!scores) return;
-    const ballPos = room.getBallPosition?.();
-    if (!ballPos) return;
-
-    if (!runtime.ball.lastPos) {
-      runtime.ball.lastPos = ballPos;
-      runtime.ball.lastMoveAt = now();
-      return;
-    }
-
-    const moved = Math.hypot(ballPos.x - runtime.ball.lastPos.x, ballPos.y - runtime.ball.lastPos.y) > 0.6;
-    if (moved) {
-      runtime.ball.lastMoveAt = now();
-      runtime.ball.lastPos = ballPos;
-      return;
-    }
-
-    const stillFor = Math.floor((now() - runtime.ball.lastMoveAt) / 1000);
-    if (stillFor >= config.game.freezeSeconds) {
-      room.sendAnnouncement('🛡 Watchdog: pelota freezeada, reiniciando partido.', null, 0xff595e, 'bold');
-      room.stopGame();
-      setTimeout(() => robustBalance(room), 500);
-      runtime.ball.lastMoveAt = now();
-    }
-
-    const inactiveFor = Math.floor((now() - runtime.lastGameActivityAt) / 1000);
-    const playersIdle = players
-      .filter((p) => p.team !== TEAM_SPEC)
-      .every((p) => {
-        const afk = runtime.afk.get(p.id);
-        if (!afk) return true;
-        return Math.floor((now() - afk.lastMoveAt) / 1000) >= Math.min(config.game.afkWarnSeconds, 15);
-      });
-
-    if (inactiveFor >= config.game.inactivityRestartSeconds && stillFor >= config.game.freezeSeconds && playersIdle) {
-      room.sendAnnouncement('🛡 Watchdog: inactividad detectada, reinicio de round.', null, 0xff595e, 'bold');
-      room.stopGame();
-      setTimeout(() => robustBalance(room), 500);
-      runtime.ball.lastMoveAt = now();
-      runtime.lastGameActivityAt = now();
-    }
-  }, config.game.watchdogIntervalMs);
-
-  process.on('uncaughtException', (error) => {
-    console.error('[FATAL] uncaughtException:', error);
-    safeRoomAction(room, () => room.sendAnnouncement('⚠️ Error crítico capturado, host sigue activo.', null, 0xff3333, 'bold'), 'uncaughtException announce');
-  });
-
-  process.on('unhandledRejection', (error) => {
-    console.error('[FATAL] unhandledRejection:', error);
-  });
-
-  process.on('SIGINT', () => {
-    clearInterval(runtime.autoSaveTimer);
-    clearInterval(runtime.watchdogTimer);
+  setInterval(() => {
     store.save();
-    process.exit(0);
-  });
+  }, config.storage.autosaveMs);
 
-  console.log(`[BOOT] Config cargada desde ${CONFIG_FILE}`);
-  console.log(`[BOOT] Data cargada. Temporada actual: ${store.data.season.id}`);
+  console.log('Host 1v1 + Discord iniciado.');
 }).catch((error) => {
-  console.error('[BOOT] No se pudo iniciar Haxball:', error);
-  process.exit(1);
+  console.error('No se pudo iniciar HaxBall:', error);
 });
